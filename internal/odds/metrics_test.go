@@ -39,8 +39,8 @@ func TestOpenLane(t *testing.T) {
 	if o.Verdict != "OPEN LANE" {
 		t.Fatalf("verdict %s: %s", o.Verdict, o.VerdictWhy)
 	}
-	if o.Merges30d != 19 { // 18 outsider merges within 25 days plus the member's
-		t.Fatalf("merges30d %d", o.Merges30d)
+	if o.Merges30d != 19 || o.Merges30dExact { // 18 outsider merges within 25 days plus the member's, from the sample
+		t.Fatalf("merges30d %d exact %v", o.Merges30d, o.Merges30dExact)
 	}
 	if o.Mergers[0].Login != "maintainer" || o.Mergers[0].Count != 19 {
 		t.Fatalf("mergers %+v", o.Mergers)
@@ -104,6 +104,32 @@ func TestSlowLaneDormantLongShotUntestedArchived(t *testing.T) {
 	}
 }
 
+func TestMergersCountAsMembersEvenAsContributor(t *testing.T) {
+	// A private org member is reported CONTRIBUTOR; if they merge PRs they are a member.
+	var r Repo
+	for i := 0; i < 20; i++ {
+		p := closed("CONTRIBUTOR", true, 2+i, 5, 1, "insider")
+		p.Author = "insider"
+		r.Closed = append(r.Closed, p)
+	}
+	for i := 0; i < 10; i++ {
+		p := closed("CONTRIBUTOR", i == 0, 2+i, 5, 1, "insider")
+		p.Author = "stranger"
+		r.Closed = append(r.Closed, p)
+	}
+	r.Merges30d, r.Merges30dKnown = 21, true
+	o := Compute(r, now)
+	if o.Outsiders.Closed != 10 || o.Outsiders.Merged != 1 || o.Members.Closed != 20 {
+		t.Fatalf("outsiders %+v members %+v", o.Outsiders, o.Members)
+	}
+	if o.Verdict != "LONG SHOT" || len(o.InferredMembers) != 1 || o.InferredMembers[0] != "insider" {
+		t.Fatalf("%s %s %v", o.Verdict, o.VerdictWhy, o.InferredMembers)
+	}
+	if o.Merges30d != 21 || !o.Merges30dExact {
+		t.Fatalf("merges30d %d exact %v", o.Merges30d, o.Merges30dExact)
+	}
+}
+
 func TestBotsAreIgnored(t *testing.T) {
 	var r Repo
 	for i := 0; i < 6; i++ {
@@ -116,8 +142,11 @@ func TestBotsAreIgnored(t *testing.T) {
 	if o.SampleClosed != 6 || o.Outsiders.Closed != 6 {
 		t.Fatalf("bots counted: %+v", o.Outsiders)
 	}
-	if !IsBot("CLAassistant", "User") || !IsBot("x", "Bot") || IsBot("larsoner", "User") {
-		t.Fatal("bot detection")
+	if !IsBot("CLAassistant", "User") || !IsBot("x", "Bot") || !IsBot("dependabot[bot]", "User") || !IsBot("release-bot", "User") {
+		t.Fatal("bot detection: false negative")
+	}
+	if IsBot("larsoner", "User") || IsBot("stalebot-fan", "User") || IsBot("copilotuser", "User") {
+		t.Fatal("bot detection: false positive on a human login")
 	}
 }
 

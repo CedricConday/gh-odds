@@ -27,6 +27,55 @@ func TestOwedVersusAnsweredByPush(t *testing.T) {
 	if r.Owed || !strings.Contains(flags(r), "ANSWERED-BY-PUSH") || strings.Contains(flags(r), "CHANGES-REQ") {
 		t.Fatalf("answered: %+v", r)
 	}
+	m.PR.LastAuthorPush = time.Time{}
+	m.PR.LastAuthorComment = now.Add(-2 * 24 * time.Hour) // answered in words instead
+	r = Triage(m, nil, nil, now)
+	if r.Owed || r.IdleDays != 2 {
+		t.Fatalf("comment should clear the debt: %+v", r)
+	}
+	if !strings.Contains(flags(r), "CHANGES-REQ") { // still requested, answered by comment not code
+		t.Fatalf("flags %s", flags(r))
+	}
+}
+
+func TestMergeCommitsAndCancelledRuns(t *testing.T) {
+	var n prNode
+	n.Number = 1
+	n.Author = &actor{Login: "me", Typename: "User"}
+	n.Commits.Nodes = append(n.Commits.Nodes, struct {
+		Commit struct {
+			CommittedDate time.Time
+			Parents       struct{ TotalCount int }
+			Author        struct {
+				User *struct{ Login string }
+			}
+			StatusCheckRollup *struct {
+				Contexts struct {
+					Nodes []struct {
+						Typename   string `json:"__typename"`
+						Name       string
+						Conclusion string
+						Status     string
+						DetailsURL string `json:"detailsUrl"`
+						Context    string
+						State      string
+						TargetURL  string `json:"targetUrl"`
+					}
+				}
+			}
+		}
+	}{})
+	c := &n.Commits.Nodes[0].Commit
+	c.CommittedDate = now
+	c.Parents.TotalCount = 2
+	c.Author.User = &struct{ Login string }{"me"}
+	p := toPR(n)
+	if !p.LastAuthorPush.IsZero() {
+		t.Fatal("a merge commit must not count as an answering push")
+	}
+	if CheckFailed(Check{Conclusion: "CANCELLED"}) || CheckFailed(Check{Conclusion: "ACTION_REQUIRED"}) || !CheckFailed(Check{Conclusion: "FAILURE"}) {
+		t.Fatal("failure set")
+	}
 }
 
 func TestBaseRedIsNotMyFailure(t *testing.T) {
@@ -58,9 +107,15 @@ func TestConflictDraftAndDormantRepo(t *testing.T) {
 }
 
 func TestSortRowsPutsActionableFirstThenOldest(t *testing.T) {
-	rows := []Row{{AgeDays: 5}, {AgeDays: 50}, {AgeDays: 1, Flags: []string{"OWES-REPLY"}}, {AgeDays: 9, Flags: []string{"CONFLICT"}}}
+	rows := []Row{{AgeDays: 5}, {AgeDays: 50, Flags: []string{"REPO-DORMANT"}}, {AgeDays: 1, Flags: []string{"OWES-REPLY"}}, {AgeDays: 9, Flags: []string{"CONFLICT"}}}
 	SortRows(rows)
 	if rows[0].AgeDays != 9 || rows[1].AgeDays != 1 || rows[2].AgeDays != 50 || rows[3].AgeDays != 5 {
 		t.Fatalf("%+v", rows)
+	}
+}
+
+func TestTruncIsRuneSafe(t *testing.T) {
+	if got := trunc("Fix Umlaute fuer Ärzte", 19); got != "Fix Umlaute fuer Är" {
+		t.Fatalf("%q", got)
 	}
 }

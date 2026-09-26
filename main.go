@@ -16,7 +16,7 @@ import (
 	"github.com/CedricConday/gh-odds/internal/odds"
 )
 
-const version = "0.1.0"
+const version = "0.1.1"
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:\n  gh odds repo <owner/name> [--sample N] [--json]\n  gh odds mine [--json]\n  gh odds <owner/name>          (same as repo)")
@@ -58,6 +58,14 @@ func main() {
 	if err := fs.Parse(args); err != nil {
 		usage()
 	}
+	if len(fs.Args()) > 0 {
+		fmt.Fprintf(os.Stderr, "gh-odds: unexpected argument %q\n", fs.Args()[0])
+		usage()
+	}
+	if *sample < 1 || *sample > 100 {
+		fmt.Fprintln(os.Stderr, "gh-odds: --sample must be between 1 and 100")
+		os.Exit(2)
+	}
 	client, err := odds.NewClient()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gh-odds:", err)
@@ -89,11 +97,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "gh-odds:", err)
 			os.Exit(1)
 		}
-		rows := triageAll(client, mine, *sample, now)
+		rows, repos := triageAll(client, mine, *sample, now)
 		if *asJSON {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
-			_ = enc.Encode(rows)
+			_ = enc.Encode(map[string]interface{}{"login": login, "rows": rows, "repos": repos})
 			return
 		}
 		fmt.Print(odds.RenderMine(rows, login))
@@ -115,13 +123,14 @@ func repoOdds(client *odds.Client, target string, sample int, now time.Time) (od
 type repoState struct {
 	odds *odds.RepoOdds
 	base map[string]bool
+	err  string
 }
 
-func triageAll(client *odds.Client, mine []odds.MinePR, sample int, now time.Time) []odds.Row {
+func triageAll(client *odds.Client, mine []odds.MinePR, sample int, now time.Time) ([]odds.Row, map[string]*odds.RepoOdds) {
 	states := map[string]*repoState{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 6)
+	sem := make(chan struct{}, 3) // gentle: three repositories at a time keeps clear of secondary limits
 	for _, m := range mine {
 		key := m.Owner + "/" + m.Name
 		mu.Lock()
@@ -137,11 +146,16 @@ func triageAll(client *odds.Client, mine []odds.MinePR, sample int, now time.Tim
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			st := &repoState{}
-			if r, err := client.FetchRepo(owner, name, sample); err == nil {
+			r, err := client.FetchRepo(owner, name, sample)
+			if err != nil {
+				st.err = "odds: " + err.Error()
+			} else {
 				o := odds.Compute(r, now)
 				st.odds = &o
 				if base, err := client.FetchBaseFailing(owner, name, r.DefaultBranch); err == nil {
 					st.base = base
+				} else {
+					st.err = "base branch checks: " + err.Error()
 				}
 			}
 			mu.Lock()
@@ -150,11 +164,21 @@ func triageAll(client *odds.Client, mine []odds.MinePR, sample int, now time.Tim
 		}(m.Owner, m.Name, key)
 	}
 	wg.Wait()
-	var rows []odds.Row
+	rows := []odds.Row{}
+	repos := map[string]*odds.RepoOdds{}
 	for _, m := range mine {
-		st := states[m.Owner+"/"+m.Name]
-		rows = append(rows, odds.Triage(m, st.base, st.odds, now))
+		key := m.Owner + "/" + m.Name
+		st := states[key]
+		row := odds.Triage(m, st.base, st.odds, now)
+		row.Error = st.err
+		if st.err != "" {
+			fmt.Fprintf(os.Stderr, "gh-odds: %s: %s\n", key, st.err)
+		}
+		rows = append(rows, row)
+		if st.odds != nil {
+			repos[key] = st.odds
+		}
 	}
 	odds.SortRows(rows)
-	return rows
+	return rows, repos
 }

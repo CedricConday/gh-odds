@@ -28,23 +28,25 @@ func NewClient() (*Client, error) {
 	return &Client{gql: gql, rest: rest}, nil
 }
 
-var bots = []string{"[bot]", "dependabot", "renovate", "github-actions", "pre-commit-ci", "codecov",
-	"allcontributors", "copilot", "claassistant", "cla-bot", "netlify", "vercel", "sonarcloud", "codspeed",
-	"azure-pipelines", "circleci", "coderabbit", "sourcery", "greptile", "welcome", "stale", "mergify",
-	"lumberbot", "meeseeks", "review-notebook-app", "gitguardian", "licensebot", "cubic-dev-ai", "-bot"}
+var botLogins = map[string]bool{
+	"dependabot": true, "renovate": true, "github-actions": true, "pre-commit-ci": true, "codecov": true,
+	"allcontributors": true, "copilot": true, "claassistant": true, "cla-bot": true, "netlify": true,
+	"vercel": true, "sonarcloud": true, "codspeed": true, "azure-pipelines": true, "circleci": true,
+	"coderabbit": true, "coderabbitai": true, "sourcery-ai": true, "greptile-apps": true, "mergify": true,
+	"bors": true, "lumberbot": true, "meeseeksdev": true, "review-notebook-app": true, "gitguardian": true,
+	"cubic-dev-ai": true, "welcome": true, "stale": true, "imgbot": true, "codacy-production": true,
+}
 
-// IsBot guesses from the login; GitHub's __typename catches the rest.
+// IsBot: GitHub's Bot type, the [bot] suffix, a known bot login, or a -bot suffix.
 func IsBot(login, typename string) bool {
 	if typename == "Bot" {
 		return true
 	}
 	l := strings.ToLower(login)
-	for _, b := range bots {
-		if strings.Contains(l, b) {
-			return true
-		}
+	if strings.HasSuffix(l, "[bot]") || strings.HasSuffix(l, "-bot") || strings.HasSuffix(l, "_bot") {
+		return true
 	}
-	return false
+	return botLogins[l]
 }
 
 type actor struct {
@@ -82,6 +84,7 @@ type prNode struct {
 		Nodes []struct {
 			Commit struct {
 				CommittedDate time.Time
+				Parents       struct{ TotalCount int }
 				Author        struct {
 					User *struct{ Login string }
 				}
@@ -108,9 +111,9 @@ const prFields = `
   number title createdAt closedAt mergedAt merged isDraft mergeable reviewDecision authorAssociation
   author { login __typename }
   mergedBy { login __typename }
-  reviews(first: 5) { nodes { submittedAt createdAt author { login __typename } } }
-  comments(first: 5) { nodes { createdAt author { login __typename } } }
-  commits(last: 1) { nodes { commit { committedDate author { user { login } } } } }`
+  reviews(first: 20) { nodes { submittedAt createdAt author { login __typename } } }
+  comments(first: 20) { nodes { createdAt author { login __typename } } }
+  commits(last: 1) { nodes { commit { committedDate parents { totalCount } author { user { login } } } } }`
 
 const prFieldsFull = `
   number title createdAt closedAt mergedAt merged isDraft mergeable reviewDecision authorAssociation
@@ -118,7 +121,7 @@ const prFieldsFull = `
   mergedBy { login __typename }
   reviews(last: 30) { nodes { submittedAt createdAt author { login __typename } } }
   comments(last: 30) { nodes { createdAt author { login __typename } } }
-  commits(last: 30) { nodes { commit { committedDate author { user { login } }
+  commits(last: 30) { nodes { commit { committedDate parents { totalCount } author { user { login } }
     statusCheckRollup { contexts(first: 60) { nodes { __typename
       ... on CheckRun { name conclusion status detailsUrl }
       ... on StatusContext { context state targetUrl } } } } } } }`
@@ -140,7 +143,13 @@ func toPR(n prNode) PR {
 		p.MergedBy = n.MergedBy.Login
 	}
 	consider := func(at time.Time, a *actor) {
-		if a == nil || a.Login == p.Author || IsBot(a.Login, a.Typename) || at.IsZero() {
+		if a == nil || at.IsZero() || IsBot(a.Login, a.Typename) {
+			return
+		}
+		if a.Login == p.Author {
+			if at.After(p.LastAuthorComment) {
+				p.LastAuthorComment = at
+			}
 			return
 		}
 		if p.FirstResponse.IsZero() || at.Before(p.FirstResponse) {
@@ -162,7 +171,8 @@ func toPR(n prNode) PR {
 		consider(c.CreatedAt, c.Author)
 	}
 	for i, c := range n.Commits.Nodes {
-		if c.Commit.Author.User != nil && c.Commit.Author.User.Login == p.Author && c.Commit.CommittedDate.After(p.LastAuthorPush) {
+		// A merge commit ("update branch") is not an answer to a review.
+		if c.Commit.Parents.TotalCount <= 1 && c.Commit.Author.User != nil && c.Commit.Author.User.Login == p.Author && c.Commit.CommittedDate.After(p.LastAuthorPush) {
 			p.LastAuthorPush = c.Commit.CommittedDate
 		}
 		if i == len(n.Commits.Nodes)-1 && c.Commit.StatusCheckRollup != nil {
@@ -182,17 +192,22 @@ func toPR(n prNode) PR {
 	return p
 }
 
-// do runs a GraphQL query with two retries on gateway errors.
+// do runs a GraphQL query, retrying gateway errors and secondary rate limits.
 func (c *Client) do(query string, vars map[string]interface{}, resp interface{}) error {
 	var err error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < 4; attempt++ {
 		if err = c.gql.Do(query, vars, resp); err == nil {
 			return nil
 		}
-		if !strings.Contains(err.Error(), "502") && !strings.Contains(err.Error(), "503") && !strings.Contains(err.Error(), "504") {
+		msg := err.Error()
+		switch {
+		case strings.Contains(msg, "502"), strings.Contains(msg, "503"), strings.Contains(msg, "504"):
+			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+		case strings.Contains(msg, "403"), strings.Contains(msg, "429"), strings.Contains(strings.ToLower(msg), "rate limit"):
+			time.Sleep(time.Duration(attempt+1) * 15 * time.Second)
+		default:
 			return err
 		}
-		time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
 	}
 	return err
 }
@@ -245,41 +260,66 @@ func (c *Client) FetchRepo(owner, name string, sample int) (Repo, error) {
 		return Repo{}, err
 	}
 	sort.Slice(r.Closed, func(i, j int) bool { return r.Closed[i].ClosedAt.After(r.Closed[j].ClosedAt) })
+	// Exact count of merges in the last 30 days; the sample is bounded by 100 and by update time.
+	var count struct {
+		Search struct{ IssueCount int }
+	}
+	since := time.Now().UTC().Add(-30 * 24 * time.Hour).Format("2006-01-02")
+	q := fmt.Sprintf("repo:%s/%s is:pr is:merged merged:>=%s", owner, name, since)
+	if err := c.do(`query($q: String!) { search(query: $q, type: ISSUE, first: 1) { issueCount } }`,
+		map[string]interface{}{"q": q}, &count); err == nil {
+		r.Merges30d, r.Merges30dKnown = count.Search.IssueCount, true
+	}
 	return r, nil
 }
 
-// FetchBaseFailing lists check names failing on the default branch head, so a
-// red check on a PR can be told apart from a red base.
+// FetchBaseFailing lists check names that failed on any of the last few
+// default-branch commits, so a red check on a PR can be told apart from a
+// check that is red or flaky on the base itself.
 func (c *Client) FetchBaseFailing(owner, name, branch string) (map[string]bool, error) {
 	if branch == "" {
 		return nil, nil
 	}
-	var resp struct {
-		CheckRuns []struct {
-			Name       string `json:"name"`
-			Conclusion string `json:"conclusion"`
-		} `json:"check_runs"`
+	var commits []struct {
+		SHA string `json:"sha"`
 	}
-	path := fmt.Sprintf("repos/%s/%s/commits/%s/check-runs?per_page=100", owner, name, branch)
-	if err := c.rest.Get(path, &resp); err != nil {
+	if err := c.rest.Get(fmt.Sprintf("repos/%s/%s/commits?sha=%s&per_page=5", owner, name, branch), &commits); err != nil {
 		return nil, err
 	}
 	out := map[string]bool{}
-	for _, cr := range resp.CheckRuns {
-		if CheckFailed(Check{Conclusion: strings.ToUpper(cr.Conclusion)}) {
-			out[cr.Name] = true
+	for _, cm := range commits {
+		for page := 1; page <= 3; page++ {
+			var resp struct {
+				TotalCount int `json:"total_count"`
+				CheckRuns  []struct {
+					Name       string `json:"name"`
+					Conclusion string `json:"conclusion"`
+				} `json:"check_runs"`
+			}
+			path := fmt.Sprintf("repos/%s/%s/commits/%s/check-runs?per_page=100&page=%d", owner, name, cm.SHA, page)
+			if err := c.rest.Get(path, &resp); err != nil {
+				break
+			}
+			for _, cr := range resp.CheckRuns {
+				if CheckFailed(Check{Conclusion: strings.ToUpper(cr.Conclusion)}) {
+					out[cr.Name] = true
+				}
+			}
+			if page*100 >= resp.TotalCount {
+				break
+			}
 		}
-	}
-	var statuses struct {
-		Statuses []struct {
-			Context string `json:"context"`
-			State   string `json:"state"`
-		} `json:"statuses"`
-	}
-	if err := c.rest.Get(fmt.Sprintf("repos/%s/%s/commits/%s/status", owner, name, branch), &statuses); err == nil {
-		for _, s := range statuses.Statuses {
-			if strings.ToUpper(s.State) == "FAILURE" || strings.ToUpper(s.State) == "ERROR" {
-				out[s.Context] = true
+		var statuses struct {
+			Statuses []struct {
+				Context string `json:"context"`
+				State   string `json:"state"`
+			} `json:"statuses"`
+		}
+		if err := c.rest.Get(fmt.Sprintf("repos/%s/%s/commits/%s/status", owner, name, cm.SHA), &statuses); err == nil {
+			for _, st := range statuses.Statuses {
+				if u := strings.ToUpper(st.State); u == "FAILURE" || u == "ERROR" {
+					out[st.Context] = true
+				}
 			}
 		}
 	}
@@ -310,7 +350,7 @@ func (c *Client) FetchMine(login string) ([]MinePR, error) {
 	query := fmt.Sprintf(`query($q: String!) {
   search(query: $q, type: ISSUE, first: 100) { nodes { __typename ... on PullRequest { repository { owner { login } name } %s } } }
 }`, prFieldsFull)
-	q := fmt.Sprintf("is:pr is:open author:%s archived:false", login)
+	q := fmt.Sprintf("is:pr is:open author:%s", login)
 	if err := c.do(query, map[string]interface{}{"q": q}, &resp); err != nil {
 		return nil, err
 	}

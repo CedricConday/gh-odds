@@ -1,6 +1,7 @@
 package odds
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"time"
@@ -34,7 +35,9 @@ type RepoOdds struct {
 	SampleTo        time.Time
 	Outsiders       Group
 	Members         Group
-	Merges30d       int
+	Merges30d       int      // from a search count when available, else from the sample
+	Merges30dExact  bool     // true when Merges30d came from the search count
+	InferredMembers []string // authors reported as CONTRIBUTOR who merge PRs, treated as members
 	Mergers         []Merger
 	OpenOutsider    int
 	OpenOutsiderOld int // older than StaleAfter
@@ -60,6 +63,20 @@ func median(ds []time.Duration) time.Duration {
 	return ds[len(ds)/2]
 }
 
+// MarshalJSON renders durations as seconds and a human string.
+func (g Group) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Closed              int     `json:"closed"`
+		Merged              int     `json:"merged"`
+		MergeRate           float64 `json:"merge_rate"`
+		FirstRespKnown      int     `json:"first_response_known"`
+		MedianFirstRespSecs float64 `json:"median_first_response_seconds"`
+		MedianFirstResp     string  `json:"median_first_response"`
+		MedianToMergeSecs   float64 `json:"median_to_merge_seconds"`
+		MedianToMerge       string  `json:"median_to_merge"`
+	}{g.Closed, g.Merged, g.MergeRate(), g.FirstRespKnown, g.MedianFirstResp.Seconds(), Humanize(g.MedianFirstResp), g.MedianToMerge.Seconds(), Humanize(g.MedianToMerge)})
+}
+
 func groupOf(prs []PR) Group {
 	var g Group
 	var first, merge []time.Duration
@@ -83,12 +100,29 @@ func groupOf(prs []PR) Group {
 }
 
 // Compute derives the odds from a fetched repository at time now.
+//
+// Membership is GitHub's author association, corrected by one observation:
+// anyone who merges PRs in the sample is a member whatever the association
+// says, because org members with private membership are reported as
+// CONTRIBUTOR and would otherwise inflate the outsider merge rate.
 func Compute(r Repo, now time.Time) RepoOdds {
 	o := RepoOdds{Repo: r.NameWithOwner, Stars: r.Stars, Archived: r.Archived, DefaultBranch: r.DefaultBranch}
-	var outs, mems []PR
 	mergers := map[string]int{}
 	for _, p := range r.Closed {
-		if p.AuthorIsBot {
+		if p.Merged && p.MergedBy != "" && !IsBot(p.MergedBy, "") {
+			mergers[p.MergedBy]++
+		}
+	}
+	member := func(p PR) bool {
+		if !Outsider(p.Association) {
+			return true
+		}
+		return mergers[p.Author] > 0
+	}
+	inferred := map[string]bool{}
+	var outs, mems []PR
+	for _, p := range r.Closed {
+		if p.AuthorIsBot || p.IsDraft {
 			continue
 		}
 		o.SampleClosed++
@@ -98,20 +132,25 @@ func Compute(r Repo, now time.Time) RepoOdds {
 		if p.ClosedAt.After(o.SampleTo) {
 			o.SampleTo = p.ClosedAt
 		}
-		if Outsider(p.Association) {
-			outs = append(outs, p)
-		} else {
+		if member(p) {
 			mems = append(mems, p)
+			if Outsider(p.Association) {
+				inferred[p.Author] = true
+			}
+		} else {
+			outs = append(outs, p)
 		}
-		if p.Merged {
-			if now.Sub(p.MergedAt) <= 30*24*time.Hour {
-				o.Merges30d++
-			}
-			if p.MergedBy != "" {
-				mergers[p.MergedBy]++
-			}
+		if p.Merged && now.Sub(p.MergedAt) <= 30*24*time.Hour {
+			o.Merges30d++
 		}
 	}
+	if r.Merges30d >= 0 && r.Merges30dKnown {
+		o.Merges30d, o.Merges30dExact = r.Merges30d, true
+	}
+	for login := range inferred {
+		o.InferredMembers = append(o.InferredMembers, login)
+	}
+	sort.Strings(o.InferredMembers)
 	o.Outsiders = groupOf(outs)
 	o.Members = groupOf(mems)
 	for login, n := range mergers {
@@ -124,7 +163,7 @@ func Compute(r Repo, now time.Time) RepoOdds {
 		return o.Mergers[i].Login < o.Mergers[j].Login
 	})
 	for _, p := range r.Open {
-		if p.AuthorIsBot || p.IsDraft || !Outsider(p.Association) {
+		if p.AuthorIsBot || p.IsDraft || member(p) {
 			continue
 		}
 		o.OpenOutsider++
