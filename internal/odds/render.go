@@ -2,6 +2,7 @@ package odds
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -110,4 +111,66 @@ func trunc(s string, n int) string {
 		return s
 	}
 	return string(rs[:n])
+}
+
+// OrgRow is one repository in an owner-wide table.
+type OrgRow struct {
+	Repo string
+	Odds *RepoOdds
+	Err  string
+}
+
+// RenderOrg lists an owner's repositories with the outsider numbers side by side,
+// the ones that demonstrably merge outsiders first.
+func RenderOrg(owner string, rows []OrgRow) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%-40s %-10s %-9s %-7s %-7s %6s %5s %6s\n", "REPO", "VERDICT", "OUTSIDERS", "FIRST", "MERGE", "M/30D", "OPEN", "STARS")
+	for _, r := range rows {
+		if r.Odds == nil {
+			fmt.Fprintf(&b, "%-40s %s\n", trunc(owner+"/"+r.Repo, 40), "FETCH-FAILED "+r.Err)
+			continue
+		}
+		o := r.Odds
+		out := "-"
+		if o.Outsiders.Closed > 0 {
+			out = fmt.Sprintf("%d/%d", o.Outsiders.Merged, o.Outsiders.Closed)
+		}
+		first, merge := "-", "-"
+		if o.Outsiders.MedianFirstResp > 0 {
+			first = Humanize(o.Outsiders.MedianFirstResp)
+		}
+		if o.Outsiders.MedianToMerge > 0 {
+			merge = Humanize(o.Outsiders.MedianToMerge)
+		}
+		fmt.Fprintf(&b, "%-40s %-10s %-9s %-7s %-7s %6d %5d %6d\n", trunc(o.Repo, 40), trunc(o.Verdict, 10), out, first, merge, o.Merges30d, o.OpenOutsider, o.Stars)
+	}
+	b.WriteString("OUTSIDERS = merged/closed outsider PRs in the sample; FIRST and MERGE are outsider medians; M/30D merges in 30 days; OPEN = open outsider PRs.\n")
+	return b.String()
+}
+
+// SortOrgRows orders repositories for an owner table: open lanes first (highest
+// outsider merge rate with at least five closed), then by merges in 30 days, then
+// by name; failures last.
+func SortOrgRows(rows []OrgRow) {
+	score := func(r OrgRow) (float64, int) {
+		if r.Odds == nil {
+			return -2, 0
+		}
+		rate := r.Odds.Outsiders.MergeRate()
+		if r.Odds.Outsiders.Closed < 5 {
+			rate = -1 + rate*0.001 // untested: below every tested repo, but still ordered among themselves
+		}
+		return rate, r.Odds.Merges30d
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		ri, mi := score(rows[i])
+		rj, mj := score(rows[j])
+		if ri != rj {
+			return ri > rj
+		}
+		if mi != mj {
+			return mi > mj
+		}
+		return rows[i].Repo < rows[j].Repo
+	})
 }

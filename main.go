@@ -16,10 +16,10 @@ import (
 	"github.com/CedricConday/gh-odds/internal/odds"
 )
 
-const version = "0.1.1"
+const version = "0.2.0"
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage:\n  gh odds repo <owner/name> [--sample N] [--json]\n  gh odds mine [--json]\n  gh odds <owner/name>          (same as repo)")
+	fmt.Fprintln(os.Stderr, "usage:\n  gh odds repo <owner/name> [--sample N] [--json]\n  gh odds org <owner> [--limit N] [--sample N] [--json]\n  gh odds mine [--json]\n  gh odds <owner/name>          (same as repo)")
 	os.Exit(2)
 }
 
@@ -35,7 +35,7 @@ func main() {
 		return
 	case "-h", "--help", "help":
 		usage()
-	case "repo", "mine":
+	case "repo", "mine", "org":
 	default:
 		if strings.Contains(cmd, "/") {
 			args = append([]string{cmd}, args...)
@@ -47,8 +47,9 @@ func main() {
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	sample := fs.Int("sample", 100, "closed PRs to sample per repository (max 100 per page)")
 	asJSON := fs.Bool("json", false, "machine-readable output")
+	limit := fs.Int("limit", 10, "org: repositories to examine, most recently pushed first (max 50)")
 	var target string
-	if cmd == "repo" {
+	if cmd == "repo" || cmd == "org" {
 		if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 			usage()
 		}
@@ -64,6 +65,10 @@ func main() {
 	}
 	if *sample < 1 || *sample > 100 {
 		fmt.Fprintln(os.Stderr, "gh-odds: --sample must be between 1 and 100")
+		os.Exit(2)
+	}
+	if *limit < 1 || *limit > 50 {
+		fmt.Fprintln(os.Stderr, "gh-odds: --limit must be between 1 and 50")
 		os.Exit(2)
 	}
 	client, err := odds.NewClient()
@@ -86,6 +91,24 @@ func main() {
 			return
 		}
 		fmt.Print(odds.RenderRepo(o))
+	case "org":
+		if strings.Contains(target, "/") {
+			fmt.Fprintln(os.Stderr, "gh-odds: org takes an owner, not owner/name")
+			os.Exit(2)
+		}
+		names, err := client.FetchOwnerRepos(target, *limit)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gh-odds:", err)
+			os.Exit(1)
+		}
+		rows := orgOdds(client, target, names, *sample, now)
+		if *asJSON {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(map[string]interface{}{"owner": target, "repos": rows})
+			return
+		}
+		fmt.Print(odds.RenderOrg(target, rows))
 	case "mine":
 		login, err := client.Login()
 		if err != nil {
@@ -106,6 +129,31 @@ func main() {
 		}
 		fmt.Print(odds.RenderMine(rows, login))
 	}
+}
+
+// orgOdds computes the card for every repository, three at a time, and sorts open lanes first.
+func orgOdds(client *odds.Client, owner string, names []string, sample int, now time.Time) []odds.OrgRow {
+	rows := make([]odds.OrgRow, len(names))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 3)
+	for i, name := range names {
+		wg.Add(1)
+		go func(i int, name string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			r, err := client.FetchRepo(owner, name, sample)
+			if err != nil {
+				rows[i] = odds.OrgRow{Repo: name, Err: err.Error()}
+				return
+			}
+			o := odds.Compute(r, now)
+			rows[i] = odds.OrgRow{Repo: name, Odds: &o}
+		}(i, name)
+	}
+	wg.Wait()
+	odds.SortOrgRows(rows)
+	return rows
 }
 
 func repoOdds(client *odds.Client, target string, sample int, now time.Time) (odds.RepoOdds, error) {

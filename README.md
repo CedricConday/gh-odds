@@ -10,7 +10,27 @@ gh odds repo mne-tools/mne-python
 gh odds mine
 ```
 
-## `gh odds repo owner/name`
+
+## An owner at a glance
+
+`gh odds org <owner> [--limit N]` runs the repository card over an organisation's (or
+user's) public, non-archived, non-fork repositories, most recently pushed first (10 by
+default, up to 50), three at a time, and prints one line each: verdict, outsider PRs
+merged over closed, the outsider medians to first response and to merge, merges in the
+last 30 days, open outsider PRs, stars. Rows are sorted so repositories that
+demonstrably merge outsiders come first; "untested" ones (fewer than five closed
+outsider PRs) sit below every tested one, and fetch failures last. It is the sweep to
+run before choosing where in an organisation to open a PR.
+
+```
+REPO                                     VERDICT    OUTSIDERS FIRST   MERGE    M/30D  OPEN  STARS
+ChurchApps/B1Admin                       OPEN LANE  8/13      43h     31h         90     1    160
+ChurchApps/B1App                         OPEN LANE  3/5       15.2d   36h         44     0     28
+ChurchApps/Api                           UNTESTED   2/4       18.8d   7h         113     1      2
+```
+
+## `gh odds repo owner/name
+gh odds org owner            # every active repo of an owner, open lanes first`
 
 ```
 anthropics/claude-code   stars 148186   default main

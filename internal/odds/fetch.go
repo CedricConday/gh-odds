@@ -372,3 +372,46 @@ func (c *Client) Login() (string, error) {
 	}
 	return u.Login, nil
 }
+
+// FetchOwnerRepos lists an organisation's (or user's) public, non-archived, non-fork
+// repositories, most recently pushed first, at most limit of them.
+func (c *Client) FetchOwnerRepos(owner string, limit int) ([]string, error) {
+	type repo struct {
+		Name     string `json:"name"`
+		Archived bool   `json:"archived"`
+		Fork     bool   `json:"fork"`
+	}
+	var names []string
+	for _, base := range []string{"orgs/" + owner + "/repos", "users/" + owner + "/repos"} {
+		page := 1
+		found := false
+		for len(names) < limit {
+			var batch []repo
+			path := fmt.Sprintf("%s?type=public&sort=pushed&per_page=100&page=%d", base, page)
+			if err := c.rest.Get(path, &batch); err != nil {
+				if page == 1 && !found {
+					break // not an org (or not a user): try the other endpoint
+				}
+				return names, err
+			}
+			found = true
+			for _, r := range batch {
+				if r.Archived || r.Fork {
+					continue
+				}
+				names = append(names, r.Name)
+				if len(names) >= limit {
+					break
+				}
+			}
+			if len(batch) < 100 {
+				break
+			}
+			page++
+		}
+		if found {
+			return names, nil
+		}
+	}
+	return nil, fmt.Errorf("no repositories found for %q", owner)
+}
